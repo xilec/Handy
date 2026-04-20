@@ -41,10 +41,16 @@ jobs:
           set -o pipefail
           nix build .#handy -L --show-trace 2>&1 | tee build.log
 
+      - name: Install coreutils for `timeout`
+        run: nix profile install nixpkgs#coreutils
+
       - name: Diagnose binary (stub check)
         if: always()
         run: |
           set +e
+          TIMEOUT="$(command -v timeout || command -v gtimeout)"
+          echo "Using timeout binary: $TIMEOUT"
+
           echo "::group::Tree"
           ls -la result/ result/Applications/ 2>/dev/null || true
           APP="result/Applications/Handy.app"
@@ -69,16 +75,28 @@ jobs:
           otool -L "$BIN"
           echo "::endgroup::"
 
-          echo "::group::otool -l (first 200 lines — load commands, rpaths)"
+          echo "::group::otool -l (load commands + rpaths, first 200 lines)"
           otool -l "$BIN" | head -200
           echo "::endgroup::"
 
-          echo "::group::nm -U (exported symbols, first 50)"
-          nm -U "$BIN" 2>&1 | head -50
+          echo "::group::LC_MAIN presence"
+          otool -l "$BIN" | grep -A 3 LC_MAIN || echo "NO LC_MAIN (would be very suspicious)"
+          echo "::endgroup::"
+
+          echo "::group::_main symbol"
+          nm "$BIN" 2>&1 | grep -E " _main$" || echo "NO _main symbol (stub indicator)"
+          echo "::endgroup::"
+
+          echo "::group::_main disassembly (first 40 insns)"
+          otool -tV "$BIN" 2>&1 | awk '/^_main:/{p=1; print; next} p && /^_[A-Za-z]/{exit} p{print; n++; if(n>40) exit}'
+          echo "::endgroup::"
+
+          echo "::group::Rust entry symbols (std::rt / panic handlers)"
+          nm "$BIN" 2>&1 | grep -E "(std.*rt.*lang_start|_ZN3std2rt|__rust_begin|__rust_panic)" | head -20 || echo "NO rust entry markers"
           echo "::endgroup::"
 
           echo "::group::Symbol count by type"
-          nm "$BIN" 2>&1 | awk '{print $2}' | sort | uniq -c | sort -rn
+          nm "$BIN" 2>&1 | awk '{print $2}' | sort | uniq -c | sort -rn | head -30
           echo "::endgroup::"
 
           echo "::group::Info.plist"
@@ -91,34 +109,28 @@ jobs:
           du -sh "$APP/Contents/Resources/"* 2>/dev/null | head -20
           echo "::endgroup::"
 
-          echo "::group::Try to run (--help, 5s timeout)"
-          # gtimeout from coreutils — fall back to a manual backgrounded kill if absent
-          if command -v gtimeout >/dev/null; then
-            gtimeout 5 "$BIN" --help
-            echo "exit=$?"
-          else
-            "$BIN" --help &
-            PID=$!
-            sleep 5
-            kill -0 $PID 2>/dev/null && kill $PID
-            wait $PID 2>/dev/null
-            echo "exit=$?"
-          fi
-          echo "::endgroup::"
+          run_with_timing() {
+            local label="$1"; shift
+            echo "::group::$label"
+            local start=$(date +%s%N)
+            # --preserve-status: let us see actual exit. 124 = timeout expired.
+            "$TIMEOUT" --preserve-status 5 "$@" 2>&1 | head -40
+            local rc=$?
+            local end=$(date +%s%N)
+            local elapsed_ms=$(( (end - start) / 1000000 ))
+            echo "---"
+            echo "exit=$rc, wall=${elapsed_ms}ms"
+            if [ "$elapsed_ms" -lt 500 ]; then
+              echo "VERDICT: died within 500ms — likely stub or early-crash"
+            else
+              echo "VERDICT: lived past 500ms — real event loop / slow startup"
+            fi
+            echo "::endgroup::"
+          }
 
-          echo "::group::Try to run (no args, 5s)"
-          if command -v gtimeout >/dev/null; then
-            gtimeout 5 "$BIN" 2>&1 || true
-            echo "exit=$?"
-          else
-            "$BIN" &
-            PID=$!
-            sleep 5
-            kill -0 $PID 2>/dev/null && kill $PID
-            wait $PID 2>/dev/null
-            echo "exit=$?"
-          fi
-          echo "::endgroup::"
+          run_with_timing "Try to run (--help)" "$BIN" --help
+          run_with_timing "Try to run (--version)" "$BIN" --version
+          run_with_timing "Try to run (no args)" "$BIN"
 
       - name: Upload .app bundle for offline analysis
         if: always()
