@@ -203,7 +203,12 @@
               mv target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/bundle/deb/*/data/usr/* $out/
             ''
             + lib.optionalString isDarwin ''
-              mkdir -p $out/Applications $out/bin
+              mkdir -p $out/Applications $out/bin $out/debug
+              # Capture the pre-bundle cargo output BEFORE the bundle move.
+              # If this has the stub _main too, the bug is upstream of
+              # cargo-tauri's bundling step.
+              cp "src-tauri/target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/handy" \
+                 "$out/debug/handy-prebundle" || echo "prebundle copy failed"
               mv src-tauri/target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/bundle/macos/Handy.app \
                 $out/Applications/
               makeWrapper "$out/Applications/Handy.app/Contents/MacOS/handy" "$out/bin/handy"

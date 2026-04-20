@@ -44,6 +44,42 @@ jobs:
       - name: Install coreutils for `timeout`
         run: nix profile install nixpkgs#coreutils
 
+      - name: Compare pre-bundle vs bundled binary
+        if: always()
+        run: |
+          set +e
+          PRE="result/debug/handy-prebundle"
+          POST="result/Applications/Handy.app/Contents/MacOS/handy"
+          if [ ! -f "$PRE" ]; then
+            echo "No pre-bundle binary captured (derivation did not copy target/release/handy)"
+            exit 0
+          fi
+          echo "::group::Sizes"
+          ls -la "$PRE" "$POST"
+          echo "::endgroup::"
+
+          echo "::group::file(1)"
+          file "$PRE" "$POST"
+          echo "::endgroup::"
+
+          echo "::group::Byte diff (first 256 bytes of each)"
+          xxd "$PRE" | head -16
+          echo "--- POST:"
+          xxd "$POST" | head -16
+          echo "::endgroup::"
+
+          echo "::group::_main (pre-bundle)"
+          otool -tV "$PRE" 2>&1 | awk '/^_main:/{p=1; print; next} p && /^_[A-Za-z]/{exit} p{print; n++; if(n>40) exit}'
+          echo "::endgroup::"
+
+          echo "::group::_main (post-bundle)"
+          otool -tV "$POST" 2>&1 | awk '/^_main:/{p=1; print; next} p && /^_[A-Za-z]/{exit} p{print; n++; if(n>40) exit}'
+          echo "::endgroup::"
+
+          echo "::group::Shasum"
+          shasum -a 256 "$PRE" "$POST"
+          echo "::endgroup::"
+
       - name: Diagnose binary (stub check)
         if: always()
         run: |
