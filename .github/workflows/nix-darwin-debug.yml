@@ -8,13 +8,20 @@ on:
   push:
     branches: [debug/darwin-flake]
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# No top-level concurrency: we want each matrix variant to finish even on
+# rapid pushes — cancelling parallel variants would lose comparison data.
 
 jobs:
   darwin-build:
     runs-on: macos-latest  # aarch64-darwin (x86_64-darwin pool retired)
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - handy                  # baseline (stub _main reproduction)
+          - handy-parse-as-library # A: add swiftc -parse-as-library
+          - handy-minimal-swift    # B: minimal stub.swift (no import/typealias)
+          - handy-sdk26            # C: apple-sdk_26 + real apple_intelligence.swift
     steps:
       - uses: actions/checkout@v4
 
@@ -35,11 +42,11 @@ jobs:
           xcode-select -p || true
           xcrun --sdk macosx --show-sdk-path || true
 
-      - name: nix build .#handy
+      - name: nix build .#${{ matrix.variant }}
         id: build
         run: |
           set -o pipefail
-          nix build .#handy -L --show-trace 2>&1 | tee build.log
+          nix build .#${{ matrix.variant }} -L --show-trace 2>&1 | tee build.log
 
       - name: Install coreutils for `timeout`
         run: nix profile install nixpkgs#coreutils
@@ -172,7 +179,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Handy.app-${{ github.sha }}
+          name: Handy.app-${{ matrix.variant }}-${{ github.sha }}
           path: result/Applications/Handy.app
           if-no-files-found: warn
           retention-days: 14
@@ -181,7 +188,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-${{ github.sha }}
+          name: build-log-${{ matrix.variant }}-${{ github.sha }}
           path: build.log
           if-no-files-found: warn
           retention-days: 14

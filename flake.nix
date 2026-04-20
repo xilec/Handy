@@ -117,10 +117,45 @@
             outputHashMode = "recursive";
           };
 
-        in
-        {
-          handy = pkgs.rustPlatform.buildRustPackage ({
-            pname = "handy";
+          # Experiment A: add -parse-as-library to swiftc invocation.
+          # Tests the hypothesis that swiftc's default script mode is
+          # emitting an empty _main that shadows Rust's. If _main becomes
+          # a proper Rust entry after this, A is confirmed.
+          patchParseAsLibrary = ''
+            sed -i 's|            "-target",|            "-parse-as-library",\n            "-target",|' src-tauri/build.rs
+          '';
+
+          # Experiment B: overwrite the stub swift file with minimal content
+          # (only @_cdecl function declarations, no `import`, no typealias).
+          # Tests whether the top-level `import Foundation` + typealias trigger
+          # script mode. If _main becomes real, B is confirmed.
+          patchMinimalSwiftStub = ''
+            cat > src-tauri/swift/apple_intelligence_stub.swift <<'MINIMAL_STUB'
+            @_cdecl("is_apple_intelligence_available")
+            public func isAppleIntelligenceAvailable() -> Int32 { return 0 }
+
+            @_cdecl("process_text_with_system_prompt_apple")
+            public func processTextWithSystemPrompt(
+                _ systemPrompt: UnsafePointer<CChar>,
+                _ userContent: UnsafePointer<CChar>,
+                maxTokens: Int32
+            ) -> UnsafeMutablePointer<AppleLLMResponse> {
+                let ptr = UnsafeMutablePointer<AppleLLMResponse>.allocate(capacity: 1)
+                ptr.initialize(to: AppleLLMResponse(response: nil, success: 0, error_message: nil))
+                return ptr
+            }
+
+            @_cdecl("free_apple_llm_response")
+            public func freeAppleLLMResponse(_ response: UnsafeMutablePointer<AppleLLMResponse>?) {
+                response?.deallocate()
+            }
+            MINIMAL_STUB
+          '';
+
+          mkHandy =
+            { pname, extraPostPatch ? "", extraNativeBuildInputs ? [ ] }:
+            pkgs.rustPlatform.buildRustPackage ({
+            inherit pname;
             inherit version;
             src = self;
 
@@ -159,7 +194,8 @@
             ''
             + lib.optionalString isDarwin ''
               patch -p1 < ${./nix/use-nix-swift.patch}
-            '';
+            ''
+            + extraPostPatch;
 
             nativeBuildInputs = with pkgs; [
               cargo-tauri.hook
@@ -179,7 +215,8 @@
               makeBinaryWrapper
               cctools
               swift
-            ]);
+            ])
+            ++ extraNativeBuildInputs;
 
             preBuild =
               lib.optionalString isDarwin ''
@@ -272,6 +309,30 @@
               bunNix = ./.nix/bun.nix;
             };
           });
+
+        in
+        {
+          # Baseline: current Darwin build producing the stub _main.
+          handy = mkHandy { pname = "handy"; };
+
+          # A: add swiftc -parse-as-library
+          handy-parse-as-library = mkHandy {
+            pname = "handy-parse-as-library";
+            extraPostPatch = lib.optionalString isDarwin patchParseAsLibrary;
+          };
+
+          # B: swap the swift stub file for a minimal declarations-only version
+          handy-minimal-swift = mkHandy {
+            pname = "handy-minimal-swift";
+            extraPostPatch = lib.optionalString isDarwin patchMinimalSwiftStub;
+          };
+
+          # C: add apple-sdk_26 (FoundationModels) so build.rs compiles the
+          # real swift file (and exposes SDKROOT via its setup hook).
+          handy-sdk26 = mkHandy {
+            pname = "handy-sdk26";
+            extraNativeBuildInputs = lib.optionals isDarwin [ pkgs.apple-sdk_26 ];
+          };
 
           default = self.packages.${system}.handy;
         }
