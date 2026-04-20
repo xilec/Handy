@@ -1,0 +1,60 @@
+--- a/src-tauri/build.rs	2026-04-07 08:26:23.610240094 -0400
++++ b/src-tauri/build.rs	2026-04-07 10:35:13.241879297 -0400
+@@ -129,16 +129,18 @@
+     let object_path = out_dir.join("apple_intelligence.o");
+     let static_lib_path = out_dir.join("libapple_intelligence.a");
+
+-    let sdk_path = String::from_utf8(
+-        Command::new("xcrun")
+-            .args(["--sdk", "macosx", "--show-sdk-path"])
+-            .output()
+-            .expect("Failed to locate macOS SDK")
+-            .stdout,
+-    )
+-    .expect("SDK path is not valid UTF-8")
+-    .trim()
+-    .to_string();
++    let sdk_path = env::var("SDKROOT").unwrap_or_else(|_| {
++        String::from_utf8(
++            Command::new("xcrun")
++                .args(["--sdk", "macosx", "--show-sdk-path"])
++                .output()
++                .expect("Failed to locate macOS SDK")
++                .stdout,
++        )
++        .expect("SDK path is not valid UTF-8")
++        .trim()
++        .to_string()
++    });
+
+     // Check if the SDK supports FoundationModels (required for Apple Intelligence)
+     let framework_path =
+@@ -157,16 +159,7 @@
+         panic!("Source file {} is missing!", source_file);
+     }
+
+-    let swiftc_path = String::from_utf8(
+-        Command::new("xcrun")
+-            .args(["--find", "swiftc"])
+-            .output()
+-            .expect("Failed to locate swiftc")
+-            .stdout,
+-    )
+-    .expect("swiftc path is not valid UTF-8")
+-    .trim()
+-    .to_string();
++    let swiftc_path = env::var("SWIFTC").unwrap_or_else(|_| "swiftc".to_string());
+
+     let toolchain_swift_lib = Path::new(&swiftc_path)
+         .parent()
+@@ -178,9 +171,8 @@
+     // Use macOS 11.0 as deployment target for compatibility
+     // The @available(macOS 26.0, *) checks in Swift handle runtime availability
+     // Weak linking for FoundationModels is handled via cargo:rustc-link-arg below
+-    let status = Command::new("xcrun")
++    let status = Command::new(&swiftc_path)
+         .args([
+-            "swiftc",
+             "-target",
+             "arm64-apple-macosx11.0",
+             "-sdk",

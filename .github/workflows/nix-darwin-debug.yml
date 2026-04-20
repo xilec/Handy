@@ -1,0 +1,139 @@
+# Darwin build reproduction for the cargo-tauri stub-binary issue
+# (NixOS/nixpkgs#507754, cjpais/Handy discussion #1242). Runs only on the
+# debug/darwin-flake branch — not meant for upstream Handy CI.
+name: "nix darwin debug"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [debug/darwin-flake]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  darwin-build:
+    runs-on: macos-latest  # aarch64-darwin (x86_64-darwin pool retired)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v13
+
+      - name: Show host info
+        run: |
+          uname -a
+          sw_vers
+          nix --version
+          xcode-select -p || true
+          xcrun --sdk macosx --show-sdk-path || true
+
+      - name: nix build .#handy
+        id: build
+        run: |
+          set -o pipefail
+          nix build .#handy -L --show-trace 2>&1 | tee build.log
+
+      - name: Diagnose binary (stub check)
+        if: always()
+        run: |
+          set +e
+          echo "::group::Tree"
+          ls -la result/ result/Applications/ 2>/dev/null || true
+          APP="result/Applications/Handy.app"
+          BIN="$APP/Contents/MacOS/handy"
+          if [ ! -e "$BIN" ]; then
+            echo "Expected binary not found at $BIN"
+            find result -maxdepth 6 2>/dev/null | head -60
+            exit 0
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Size"
+          ls -la "$BIN"
+          stat -f '%z bytes' "$BIN"
+          echo "::endgroup::"
+
+          echo "::group::file(1)"
+          file "$BIN"
+          echo "::endgroup::"
+
+          echo "::group::otool -L (dylib deps)"
+          otool -L "$BIN"
+          echo "::endgroup::"
+
+          echo "::group::otool -l (first 200 lines — load commands, rpaths)"
+          otool -l "$BIN" | head -200
+          echo "::endgroup::"
+
+          echo "::group::nm -U (exported symbols, first 50)"
+          nm -U "$BIN" 2>&1 | head -50
+          echo "::endgroup::"
+
+          echo "::group::Symbol count by type"
+          nm "$BIN" 2>&1 | awk '{print $2}' | sort | uniq -c | sort -rn
+          echo "::endgroup::"
+
+          echo "::group::Info.plist"
+          plutil -p "$APP/Contents/Info.plist" 2>&1 | head -40
+          echo "::endgroup::"
+
+          echo "::group::Bundle size breakdown"
+          du -sh "$APP" 2>/dev/null
+          du -sh "$APP/Contents/"* 2>/dev/null
+          du -sh "$APP/Contents/Resources/"* 2>/dev/null | head -20
+          echo "::endgroup::"
+
+          echo "::group::Try to run (--help, 5s timeout)"
+          # gtimeout from coreutils — fall back to a manual backgrounded kill if absent
+          if command -v gtimeout >/dev/null; then
+            gtimeout 5 "$BIN" --help
+            echo "exit=$?"
+          else
+            "$BIN" --help &
+            PID=$!
+            sleep 5
+            kill -0 $PID 2>/dev/null && kill $PID
+            wait $PID 2>/dev/null
+            echo "exit=$?"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Try to run (no args, 5s)"
+          if command -v gtimeout >/dev/null; then
+            gtimeout 5 "$BIN" 2>&1 || true
+            echo "exit=$?"
+          else
+            "$BIN" &
+            PID=$!
+            sleep 5
+            kill -0 $PID 2>/dev/null && kill $PID
+            wait $PID 2>/dev/null
+            echo "exit=$?"
+          fi
+          echo "::endgroup::"
+
+      - name: Upload .app bundle for offline analysis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Handy.app-${{ github.sha }}
+          path: result/Applications/Handy.app
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.sha }}
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 14

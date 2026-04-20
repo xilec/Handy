@@ -24,32 +24,39 @@
       supportedSystems = [
         "x86_64-linux"
         "aarch64-linux"
+        # Darwin support lives on debug/darwin-flake branch only — used to
+        # reproduce the cargo-tauri stub-binary issue philocalyst hit in
+        # NixOS/nixpkgs#507754 (see tmp/pending-tasks.md). Not for upstream.
+        "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
-      # Read version from Cargo.toml
       cargoToml = fromTOML (builtins.readFile ./src-tauri/Cargo.toml);
       version = cargoToml.package.version;
 
-      # Shared native library dependencies for both package build and dev shell.
-      # Keep in sync: if a native dep is needed for compilation, add it here.
-      commonNativeDeps = pkgs: with pkgs; [
+      # Verified on philocalyst/nixpkgs#1 with bun 1.3.11 at Handy merge commit
+      # af6ec6c (squash of cjpais/Handy#1256, content identical to PR head
+      # 681c6a9). Recompute via normalize-install.ts on version bump.
+      frontendDepsHashes = {
+        "x86_64-linux" = "sha256-tJ6LK99dELOiR0BcsTRTt/vLyNamntujLxhBy5Xl/lc=";
+        "aarch64-linux" = "sha256-S+dX6ZVgv9dexxIHoa5PxP7e0nxf/d7cKUGty5eEi8A=";
+        "aarch64-darwin" = "sha256-DQbogNBQ9izK5GPmoOudqiB2lJvct1vZI2U5lp3WFy8=";
+      };
+
+      linuxNativeDeps = pkgs: with pkgs; [
         webkitgtk_4_1
         gtk3
         glib
         libsoup_3
         alsa-lib
-        onnxruntime
         libayatana-appindicator
         libevdev
         libxtst
         gtk-layer-shell
-        openssl
         vulkan-loader
         vulkan-headers
         shaderc
       ];
 
-      # GStreamer plugins for WebKitGTK audio/video
       gstPlugins = pkgs: with pkgs.gst_all_1; [
         gstreamer
         gst-plugins-base
@@ -58,13 +65,6 @@
         gst-plugins-ugly
       ];
 
-      # Shared environment variables for Rust/native builds
-      commonEnv = pkgs: let lib = pkgs.lib; in {
-        ORT_LIB_LOCATION = "${pkgs.onnxruntime}/lib";
-        ORT_PREFER_DYNAMIC_LINK = "1";
-        GST_PLUGIN_SYSTEM_PATH_1_0 = "${lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" (gstPlugins pkgs)}";
-      };
-
     in
     {
       packages = forAllSystems (
@@ -72,11 +72,12 @@
         let
           pkgs = import nixpkgs {
             inherit system;
-            overlays = [
-              bun2nix.overlays.default
-            ];
+            overlays = [ bun2nix.overlays.default ];
           };
           lib = pkgs.lib;
+          isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
+          isLinux = pkgs.stdenv.hostPlatform.isLinux;
+
           combinedAlsaPlugins = pkgs.symlinkJoin {
             name = "combined-alsa-plugins";
             paths = [
@@ -84,9 +85,41 @@
               "${pkgs.alsa-plugins}/lib/alsa-lib"
             ];
           };
+
+          # FOD path for frontend deps — used on Darwin because bun2nix's
+          # bun.lock-based fetch has not been verified on Darwin yet. Linux
+          # keeps the bun2nix path below.
+          frontendDeps = pkgs.stdenv.mkDerivation {
+            pname = "handy-frontend-deps";
+            inherit version;
+            src = self;
+            nativeBuildInputs = [ pkgs.bun ];
+            dontConfigure = true;
+            buildPhase = ''
+              runHook preBuild
+              export HOME=$(mktemp -d)
+              export BUN_INSTALL_CACHE_DIR=$(mktemp -d)
+              bun install --linker=isolated --force --frozen-lockfile \
+                --ignore-scripts --no-progress
+              bun --bun "$PWD/.nix/scripts/normalize-install.ts"
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out
+              cp -R node_modules $out/
+              runHook postInstall
+            '';
+            dontFixup = true;
+            outputHash = frontendDepsHashes.${system} or (throw ''
+              handy: no frontendDeps hash for ${system}.
+            '');
+            outputHashMode = "recursive";
+          };
+
         in
         {
-          handy = pkgs.rustPlatform.buildRustPackage {
+          handy = pkgs.rustPlatform.buildRustPackage ({
             pname = "handy";
             inherit version;
             src = self;
@@ -95,92 +128,112 @@
 
             cargoLock = {
               lockFile = ./src-tauri/Cargo.lock;
-              # Automatically fetch git dependencies using builtins.fetchGit.
-              # This eliminates the need for manual outputHashes that had to be
-              # updated every time a git dependency changed in Cargo.lock.
-              # Safe for standalone flakes (not allowed in nixpkgs, it is needed something like crate2nix).
               allowBuiltinFetchGit = true;
             };
 
             postPatch = ''
-              ${pkgs.jq}/bin/jq 'del(.build.beforeBuildCommand) | .bundle.createUpdaterArtifacts = false' \
-                src-tauri/tauri.conf.json > $TMPDIR/tauri.conf.json
+              ${pkgs.jq}/bin/jq '
+                del(.build.beforeBuildCommand) |
+                .bundle.createUpdaterArtifacts = false |
+                .bundle.macOS.signingIdentity = null |
+                .bundle.macOS.hardenedRuntime = false
+              ' src-tauri/tauri.conf.json > $TMPDIR/tauri.conf.json
               cp $TMPDIR/tauri.conf.json src-tauri/tauri.conf.json
 
-              # Strip postinstall hook — it runs check-nix-deps.ts which is only
-              # needed during local development, not inside the Nix sandbox.
               ${pkgs.jq}/bin/jq 'del(.scripts.postinstall)' \
                 package.json > $TMPDIR/package.json
               cp $TMPDIR/package.json package.json
 
-              # Point libappindicator-sys to the Nix store path
+              # cbindgen's cargo metadata fails in the sandbox
+              substituteInPlace $cargoDepsCopy/ferrous-opencc-0.2.3/build.rs \
+                --replace-fail '.expect("Unable to generate bindings")' '.ok();'
+              substituteInPlace $cargoDepsCopy/ferrous-opencc-0.2.3/build.rs \
+                --replace-fail '.write_to_file("opencc.h");' '// skipped'
+            ''
+            + lib.optionalString isLinux ''
               substituteInPlace \
                 $cargoDepsCopy/libappindicator-sys-*/src/lib.rs \
                 --replace-fail \
                   "libayatana-appindicator3.so.1" \
                   "${pkgs.libayatana-appindicator}/lib/libayatana-appindicator3.so.1"
-
-              # Disable cbindgen in ferrous-opencc (calls cargo metadata which fails in sandbox)
-              # Upstream removed this call in v0.3.1+
-              substituteInPlace $cargoDepsCopy/ferrous-opencc-0.2.3/build.rs \
-                --replace-fail '.expect("Unable to generate bindings")' '.ok();'
-              substituteInPlace $cargoDepsCopy/ferrous-opencc-0.2.3/build.rs \
-                --replace-fail '.write_to_file("opencc.h");' '// skipped'
+            ''
+            + lib.optionalString isDarwin ''
+              patch -p1 < ${./nix/use-nix-swift.patch}
             '';
-
-            # Bun dependencies: fetched per-package using hashes from .nix/bun.nix.
-            # This file is auto-generated by `bunx bun2nix -o .nix/bun.nix` and
-            # kept in sync via the postinstall hook in package.json.
-            # To regenerate manually: bun scripts/check-nix-deps.ts
-            bunDeps = pkgs.bun2nix.fetchBunDeps {
-              bunNix = ./.nix/bun.nix;
-            };
 
             nativeBuildInputs = with pkgs; [
               cargo-tauri.hook
               pkg-config
-              wrapGAppsHook4
               bun
-              # pkgs.bun2nix (from overlay), not the flake input — `with pkgs;`
-              # doesn't shadow function arguments in Nix.
-              pkgs.bun2nix.hook # Sets up node_modules from pre-fetched bun cache
               jq
               cmake
               rustPlatform.bindgenHook
+            ]
+            ++ lib.optionals isLinux (with pkgs; [
+              wrapGAppsHook4
+              pkgs.bun2nix.hook
               shaderc
-            ];
+            ])
+            ++ lib.optionals isDarwin (with pkgs; [
+              nodejs
+              makeBinaryWrapper
+              cctools
+              swift
+            ]);
 
-            preBuild = ''
-              # bun2nix.hook has already set up node_modules from pre-fetched cache.
-              # Build the frontend with bun (tsc + vite).
-              export HOME=$TMPDIR
-              bun run build
-            '';
+            preBuild =
+              lib.optionalString isDarwin ''
+                cp -R ${frontendDeps}/node_modules .
+                chmod -R u+w node_modules
+                patchShebangs node_modules
+              ''
+              + ''
+                export HOME=$TMPDIR
+                bun run build
+              '';
 
-            # Tests require runtime resources (audio devices, model files, GPU/Vulkan)
-            # not available in the Nix build sandbox
             doCheck = false;
 
-            # The tauri hook's installPhase expects target/ in cwd, but our
-            # cargoRoot puts it under src-tauri/. Override to extract the DEB.
             installPhase = ''
               runHook preInstall
               mkdir -p $out
+            ''
+            + lib.optionalString isLinux ''
               cd src-tauri
               mv target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/bundle/deb/*/data/usr/* $out/
+            ''
+            + lib.optionalString isDarwin ''
+              mkdir -p $out/Applications $out/bin
+              mv src-tauri/target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/bundle/macos/Handy.app \
+                $out/Applications/
+              makeWrapper "$out/Applications/Handy.app/Contents/MacOS/handy" "$out/bin/handy"
+            ''
+            + ''
               runHook postInstall
             '';
 
-            buildInputs = commonNativeDeps pkgs ++ (with pkgs; [
+            buildInputs = [
+              pkgs.onnxruntime
+              pkgs.openssl
+            ]
+            ++ lib.optionals isLinux (linuxNativeDeps pkgs ++ (with pkgs; [
               glib-networking
               libx11
-            ]) ++ gstPlugins pkgs;
+            ]) ++ gstPlugins pkgs);
 
-            env = commonEnv pkgs // {
+            env = {
+              ORT_LIB_LOCATION = "${pkgs.onnxruntime}/lib";
+              ORT_PREFER_DYNAMIC_LINK = "1";
               OPENSSL_NO_VENDOR = "1";
+            }
+            // lib.optionalAttrs isLinux {
+              GST_PLUGIN_SYSTEM_PATH_1_0 = lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" (gstPlugins pkgs);
+            }
+            // lib.optionalAttrs isDarwin {
+              SWIFTC = "${pkgs.swift}/bin/swiftc";
             };
 
-            preFixup = ''
+            preFixup = lib.optionalString isLinux ''
               gappsWrapperArgs+=(
                 --set WEBKIT_DISABLE_DMABUF_RENDERER 1
                 --set ALSA_PLUGIN_DIR "${combinedAlsaPlugins}"
@@ -193,6 +246,14 @@
               )
             '';
 
+            # DYLD_LIBRARY_PATH is blocked by SIP on macOS, so patch rpath
+            postFixup = lib.optionalString isDarwin ''
+              install_name_tool -add_rpath ${pkgs.onnxruntime}/lib \
+                "$out/Applications/Handy.app/Contents/MacOS/handy"
+            '';
+
+            passthru = lib.optionalAttrs isDarwin { inherit frontendDeps; };
+
             meta = {
               description = "A free, open source, and extensible speech-to-text application that works completely offline";
               homepage = "https://github.com/cjpais/Handy";
@@ -200,13 +261,17 @@
               mainProgram = "handy";
               platforms = supportedSystems;
             };
-          };
+          }
+          // lib.optionalAttrs isLinux {
+            bunDeps = pkgs.bun2nix.fetchBunDeps {
+              bunNix = ./.nix/bun.nix;
+            };
+          });
 
           default = self.packages.${system}.handy;
         }
       );
 
-      # NixOS module for system-level integration (udev, input group)
       nixosModules.default =
         { lib, pkgs, ... }:
         {
@@ -214,7 +279,6 @@
           programs.handy.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.handy;
         };
 
-      # Home-manager module for per-user service
       homeManagerModules.default =
         { lib, pkgs, ... }:
         {
@@ -222,41 +286,48 @@
           services.handy.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.handy;
         };
 
-      # Development shell for building from source
       devShells = forAllSystems (
         system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-          };
+          pkgs = import nixpkgs { inherit system; };
+          lib = pkgs.lib;
+          isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
         in
         {
           default = pkgs.mkShell {
-            buildInputs = commonNativeDeps pkgs ++ (with pkgs; [
-              # Rust toolchain
-              rustc
-              cargo
-              rust-analyzer
-              clippy
-              # Frontend
-              nodejs
-              bun
-              # Build tools
-              cargo-tauri
-              pkg-config
-              rustPlatform.bindgenHook
-              cmake
-            ]);
+            buildInputs =
+              (with pkgs; [
+                rustc
+                cargo
+                rust-analyzer
+                clippy
+                nodejs
+                bun
+                cargo-tauri
+                pkg-config
+                rustPlatform.bindgenHook
+                cmake
+              ])
+              ++ lib.optionals (!isDarwin) (linuxNativeDeps pkgs);
 
-            inherit (commonEnv pkgs)
-              ORT_LIB_LOCATION
-              ORT_PREFER_DYNAMIC_LINK
-              GST_PLUGIN_SYSTEM_PATH_1_0;
+            ORT_LIB_LOCATION = "${pkgs.onnxruntime}/lib";
+            ORT_PREFER_DYNAMIC_LINK = "1";
 
-            LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath [ pkgs.libayatana-appindicator pkgs.onnxruntime pkgs.vulkan-loader ]}";
+            GST_PLUGIN_SYSTEM_PATH_1_0 = lib.optionalString (!isDarwin) (
+              lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" (gstPlugins pkgs)
+            );
 
-            # Same as wrapGAppsHook4
-            XDG_DATA_DIRS = "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:${pkgs.hicolor-icon-theme}/share";
+            LD_LIBRARY_PATH = lib.optionalString (!isDarwin) (
+              lib.makeLibraryPath [
+                pkgs.libayatana-appindicator
+                pkgs.onnxruntime
+                pkgs.vulkan-loader
+              ]
+            );
+
+            XDG_DATA_DIRS = lib.optionalString (!isDarwin) (
+              "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:${pkgs.hicolor-icon-theme}/share"
+            );
 
             shellHook = ''
               echo "Handy development environment"
