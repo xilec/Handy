@@ -1,0 +1,63 @@
+# Temporary workflow for the test/swiftc-env-vars branch only.
+# Validates that build.rs honors SDKROOT/SWIFTC when set and falls back
+# to xcrun when unset, before the env-var commit lands in upstream PR
+# cjpais/Handy#1316. Delete this file after verification.
+
+name: "verify swiftc env-var paths (test only)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [test/swiftc-env-vars]
+
+jobs:
+  apple-toolchain:
+    runs-on: macos-26
+    name: "Apple toolchain (xcrun fallback)"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - run: bun install
+      - run: bun run build
+      - name: cargo build (env unset → xcrun fallback)
+        working-directory: src-tauri
+        run: |
+          test -z "${SDKROOT:-}"
+          test -z "${SWIFTC:-}"
+          cargo build --release --target aarch64-apple-darwin
+      - name: verify _main is real
+        working-directory: src-tauri
+        run: |
+          BIN=target/aarch64-apple-darwin/release/handy
+          MAIN_INSNS=$(otool -tV "$BIN" | awk '/^_main:/{p=1; next} p && /^_[A-Za-z]/{exit} p{n++} END{print n}')
+          echo "_main: $MAIN_INSNS insns"
+          test "$MAIN_INSNS" -ge 10
+
+  nix-darwin:
+    runs-on: macos-26
+    name: "Nix build (xilec/nixpkgs fork)"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v13
+      - name: nix-build (src = this branch)
+        run: |
+          nix-build -E '
+            let
+              nixpkgs = import (fetchTarball {
+                url = "https://github.com/xilec/nixpkgs/archive/handy-cross-platform-deps.tar.gz";
+              }) {};
+            in
+            nixpkgs.handy.overrideAttrs (_: { src = ./.; })
+          '
+      - name: verify _main is real
+        run: |
+          BIN=result/Applications/Handy.app/Contents/MacOS/handy
+          MAIN_INSNS=$(otool -tV "$BIN" | awk '/^_main:/{p=1; next} p && /^_[A-Za-z]/{exit} p{n++} END{print n}')
+          echo "_main: $MAIN_INSNS insns"
+          test "$MAIN_INSNS" -ge 10
