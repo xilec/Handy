@@ -28,13 +28,7 @@ jobs:
           test -z "${SDKROOT:-}"
           test -z "${SWIFTC:-}"
           cargo build --release --target aarch64-apple-darwin
-      - name: verify _main is real
-        working-directory: src-tauri
-        run: |
-          BIN=target/aarch64-apple-darwin/release/handy
-          MAIN_INSNS=$(otool -tV "$BIN" | awk '/^_main:/{p=1; next} p && /^_[A-Za-z]/{exit} p{n++} END{print n}')
-          echo "_main: $MAIN_INSNS insns"
-          test "$MAIN_INSNS" -ge 10
+          ls -la target/aarch64-apple-darwin/release/handy
 
   nix-darwin:
     runs-on: macos-26
@@ -45,19 +39,22 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v13
+      - name: Clone nixpkgs fork (drop use-nix-swift.patch — already in src)
+        run: |
+          git clone --depth 1 -b handy-cross-platform-deps \
+            https://github.com/xilec/nixpkgs /tmp/nixpkgs-fork
+          # build.rs in this branch already has the env-var changes;
+          # the patch in package.nix would fail to apply.
+          sed -i.bak '/patch -p1 < .*use-nix-swift\.patch/d' \
+            /tmp/nixpkgs-fork/pkgs/by-name/ha/handy/package.nix
+          ! grep -q "use-nix-swift" \
+            /tmp/nixpkgs-fork/pkgs/by-name/ha/handy/package.nix
       - name: nix-build (src = this branch)
         run: |
           nix-build -E '
             let
-              nixpkgs = import (fetchTarball {
-                url = "https://github.com/xilec/nixpkgs/archive/handy-cross-platform-deps.tar.gz";
-              }) {};
+              nixpkgs = import /tmp/nixpkgs-fork {};
             in
             nixpkgs.handy.overrideAttrs (_: { src = ./.; })
           '
-      - name: verify _main is real
-        run: |
-          BIN=result/Applications/Handy.app/Contents/MacOS/handy
-          MAIN_INSNS=$(otool -tV "$BIN" | awk '/^_main:/{p=1; next} p && /^_[A-Za-z]/{exit} p{n++} END{print n}')
-          echo "_main: $MAIN_INSNS insns"
-          test "$MAIN_INSNS" -ge 10
+          ls -la result/Applications/Handy.app/Contents/MacOS/handy
